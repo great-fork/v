@@ -1,168 +1,100 @@
-// Copyright (c) 2019 Alexander Medvednikov. All rights reserved.
+// Copyright (c) 2019-2021 Alexander Medvednikov. All rights reserved.
 // Use of this source code is governed by an MIT license
 // that can be found in the LICENSE file.
-
 module os
 
-#include <sys/stat.h>
-#include <signal.h>
-#include <unistd.h>
-#include <errno.h>
-//#include <execinfo.h> // for backtrace_symbols_fd 
-
-/* 
-struct dirent {
-               d_ino int 
-               d_off int 
-	d_reclen u16 
-	d_type byte 
-	d_name [256]byte 
-} 
-*/ 
-
-struct C.dirent {
-	d_name byteptr 
-} 
+pub const (
+	args          = []string{}
+	max_path_len  = 4096
+	wd_at_startup = getwd()
+)
 
 const (
-	args = []string
-	MAX_PATH = 4096
+	f_ok = 0
+	x_ok = 1
+	w_ok = 2
+	r_ok = 4
 )
 
-// Windows 
-import const (
-	FILE_ATTRIBUTE_DIRECTORY
-	INVALID_FILE_ATTRIBUTES
-) 
-
-struct FILE {
+pub struct Result {
+pub:
+	exit_code int
+	output    string
+	// stderr string // TODO
 }
 
-struct File {
-	cfile *FILE
+[unsafe]
+pub fn (mut result Result) free() {
+	unsafe { result.output.free() }
 }
 
-struct FileInfo {
-	name string
-	size int
-}
-
-import const (
-	SEEK_SET
-	SEEK_END
-	SA_SIGINFO
-	S_IFMT
-	S_IFDIR
-	SIGABRT
-	SIGFPE
-	SIGILL
-	SIGINT
-	SIGSEGV
-	SIGTERM
-)
-
-struct C.stat {
-	st_size int
-	st_mode int
-	st_mtime int 
-}
-
-struct C.DIR {
-
-}
-
-//struct C.dirent {
-	//d_name byteptr
-
-//}
-
-struct C.sigaction {
-mut:
-	sa_mask int
-	sa_sigaction int
-	sa_flags   int
-}
-
-fn C.getline(voidptr, voidptr, voidptr) int
-fn C.ftell(fp voidptr) int
-fn C.getenv(byteptr) byteptr
-fn C.sigaction(int, voidptr, int)
-
-fn todo_remove(){}
-
-fn init_os_args(argc int, argv *byteptr) []string {
-	mut args := []string
-	for i := 0; i < argc; i++ {
-		args << string(argv[i])
+// cp_all will recursively copy `src` to `dst`,
+// optionally overwriting files or dirs in `dst`.
+pub fn cp_all(src string, dst string, overwrite bool) ? {
+	source_path := real_path(src)
+	dest_path := real_path(dst)
+	if !exists(source_path) {
+		return error("Source path doesn't exist")
 	}
-	return args
-}
-
-fn parse_windows_cmd_line(cmd byteptr) []string {
-	s := string(cmd)
-	return s.split(' ')
-}
-
-// read_file reads the file in `path` and returns the contents.
-pub fn read_file(path string) ?string { 
-	mut mode := 'rb' 
-	cpath := path.cstr()
-	fp := C.fopen(cpath, mode.cstr()) 
-	if isnil(fp) {
-		return error('failed to open file "$path"')
+	// single file copy
+	if !is_dir(source_path) {
+		adjusted_path := if is_dir(dest_path) {
+			join_path(dest_path, file_name(source_path))
+		} else {
+			dest_path
+		}
+		if exists(adjusted_path) {
+			if overwrite {
+				rm(adjusted_path) ?
+			} else {
+				return error('Destination file path already exist')
+			}
+		}
+		cp(source_path, adjusted_path) ?
+		return
 	}
-	C.fseek(fp, 0, SEEK_END)
-	fsize := C.ftell(fp)
-	// C.fseek(fp, 0, SEEK_SET)  // same as `C.rewind(fp)` below
-	C.rewind(fp)
-	mut str := malloc(fsize + 1)
-	C.fread(str, fsize, 1, fp)
-	C.fclose(fp)
-	str[fsize] = 0
-	return string(str, fsize)
+	if !exists(dest_path) {
+		mkdir(dest_path) ?
+	}
+	if !is_dir(dest_path) {
+		return error('Destination path is not a valid directory')
+	}
+	files := ls(source_path) ?
+	for file in files {
+		sp := join_path(source_path, file)
+		dp := join_path(dest_path, file)
+		if is_dir(sp) {
+			if !exists(dp) {
+				mkdir(dp) ?
+			}
+		}
+		cp_all(sp, dp, overwrite) or {
+			rmdir(dp) or { return err }
+			return err
+		}
+	}
 }
 
-// file_size returns the size of the file located in `path`.
-pub fn file_size(path string) int {
-	s := C.stat{}
-	C.stat(path.str, &s)
-	return s.st_size
-}
-
-pub fn mv(old, new string) {
-	C.rename(old.cstr(), new.cstr())
+// mv_by_cp first copies the source file, and if it is copied successfully, deletes the source file.
+// may be used when you are not sure that the source and target are on the same mount/partition.
+pub fn mv_by_cp(source string, target string) ? {
+	cp(source, target) ?
+	rm(source) ?
 }
 
 // read_lines reads the file in `path` into an array of lines.
-// TODO return `?[]string` TODO implement `?[]` support
-pub fn read_lines(path string) []string {
-	mut res := []string
-	mut buf := [1000]byte
-	cpath := path.cstr()
-	fp := C.fopen(cpath, 'rb')
-	if isnil(fp) {
-		// TODO
-		// return error('failed to open file "$path"')
-		return res
-	}
-	for C.fgets(buf, 1000, fp) != 0 {
-		mut val := ''
-		buf[C.strlen(buf) - 1] = `\0` // eat the newline fgets() stores
-		$if windows {
-			if buf[strlen(buf)-2] == 13 {
-				buf[strlen(buf) - 2] = `\0`
-			}
-		}
-		res << tos_clone(buf)
-	}
-	C.fclose(fp)
+pub fn read_lines(path string) ?[]string {
+	buf := read_file(path) ?
+	res := buf.split_into_lines()
+	unsafe { buf.free() }
 	return res
 }
 
-fn read_ulines(path string) []ustring {
-	lines := read_lines(path)
+// read_ulines reads the file in `path` into an array of ustring lines.
+fn read_ulines(path string) ?[]ustring {
+	lines := read_lines(path) ?
 	// mut ulines := new_array(0, lines.len, sizeof(ustring))
-	mut ulines := []ustring
+	mut ulines := []ustring{}
 	for myline in lines {
 		// ulines[i] = ustr
 		ulines << myline.ustring()
@@ -170,582 +102,545 @@ fn read_ulines(path string) []ustring {
 	return ulines
 }
 
-pub fn open(path string) ?File {
-	cpath := path.cstr() 
-	file := File {
-		cfile: C.fopen(cpath, 'rb') 
+// sigint_to_signal_name will translate `si` signal integer code to it's string code representation.
+pub fn sigint_to_signal_name(si int) string {
+	// POSIX signals:
+	match si {
+		1 { return 'SIGHUP' }
+		2 { return 'SIGINT' }
+		3 { return 'SIGQUIT' }
+		4 { return 'SIGILL' }
+		6 { return 'SIGABRT' }
+		8 { return 'SIGFPE' }
+		9 { return 'SIGKILL' }
+		11 { return 'SIGSEGV' }
+		13 { return 'SIGPIPE' }
+		14 { return 'SIGALRM' }
+		15 { return 'SIGTERM' }
+		else {}
 	}
-	if isnil(file.cfile) {
-		return error('failed to open file "$path"')
-	}
-	return file 
-}
-
-// create creates a file at a specified location and returns a writable `File` object.
-pub fn create(path string) ?File {
-	cpath := path.cstr() 
-	file := File {
-		cfile: C.fopen(cpath, 'wb') 
-	}
-	if isnil(file.cfile) {
-		return error('failed to create file "$path"')
-	}
-	return file 
-}
-
-pub fn open_append(path string) ?File {
-	cpath := path.cstr() 
-	file := File {
-		cfile: C.fopen(cpath, 'ab') 
-	}
-	if isnil(file.cfile) {
-		return error('failed to create file "$path"')
-	}
-	return file 
-}
-
-pub fn (f File) write(s string) {
-	ss := s.clone()
-	C.fputs(ss.cstr(), f.cfile)
-	// ss.free()
-	// C.fwrite(s.str, 1, s.len, f.cfile)
-}
-
-// convert any value to []byte (LittleEndian) and write it
-// for example if we have write(7, 4), "07 00 00 00" gets written
-// write(0x1234, 2) => "34 12"
-pub fn (f File) write_bytes(data voidptr, size int) {
-	C.fwrite(data, 1, size, f.cfile)
-}
-
-pub fn (f File) write_bytes_at(data voidptr, size, pos int) {
-	C.fseek(f.cfile, pos, SEEK_SET)
-	C.fwrite(data, 1, size, f.cfile)
-	C.fseek(f.cfile, 0, SEEK_END)
-}
-
-pub fn (f File) writeln(s string) {
-	// C.fwrite(s.str, 1, s.len, f.cfile)
-	// ss := s.clone()
-	// TODO perf
-	C.fputs(s.cstr(), f.cfile)
-	// ss.free()
-	C.fputs('\n', f.cfile)
-}
-
-pub fn (f File) flush() {
-	C.fflush(f.cfile)
-}
-
-pub fn (f File) close() {
-	C.fclose(f.cfile)
-}
-
-// system starts the specified command, waits for it to complete, and returns its code.
-pub fn system(cmd string) int {
-	ret := C.system(cmd.cstr()) 
-	if ret == -1 {
-		os.print_c_errno()
-	}
-	return ret
-}
-
-fn popen(path string) *FILE {
-	cpath := path.cstr()
-	$if windows {
-		return C._popen(cpath, 'r')
-	}
-	$else {
-		return C.popen(cpath, 'r')
-	}
-}
-
-// exec starts the specified command, waits for it to complete, and returns its output.
-pub fn exec(cmd string) string {
-	cmd = '$cmd 2>&1'
-	f := popen(cmd) 
-	if isnil(f) {
-		// TODO optional or error code 
-		println('popen $cmd failed')
-		return '' 
-	}
-	buf := [1000]byte 
-	mut res := ''
-	for C.fgets(buf, 1000, f) != 0 { 
-		res += tos(buf, strlen(buf)) 
-	}
-	return res.trim_space()
-}
-
-// `getenv` returns the value of the environment variable named by the key.
-pub fn getenv(key string) string {
-	s := C.getenv(key.cstr())
-	if isnil(s) {
-		return ''
-	}
-	return string(s)
-}
-
-pub fn setenv(name string, value string, overwrite bool) int {
-	$if windows {
-		format := '$name=$value'
-
-		if overwrite {
-			return C._putenv(format.cstr())
+	$if linux {
+		// From `man 7 signal` on linux:
+		match si {
+			// TODO dependent on platform
+			// works only on x86/ARM/most others
+			10 /* , 30, 16 */ { return 'SIGUSR1' }
+			12 /* , 31, 17 */ { return 'SIGUSR2' }
+			17 /* , 20, 18 */ { return 'SIGCHLD' }
+			18 /* , 19, 25 */ { return 'SIGCONT' }
+			19 /* , 17, 23 */ { return 'SIGSTOP' }
+			20 /* , 18, 24 */ { return 'SIGTSTP' }
+			21 /* , 26 */ { return 'SIGTTIN' }
+			22 /* , 27 */ { return 'SIGTTOU' }
+			// /////////////////////////////
+			5 { return 'SIGTRAP' }
+			7 { return 'SIGBUS' }
+			else {}
 		}
-
-		return -1
-	} 
-	$else { 
-		return C.setenv(name.cstr(), value.cstr(), overwrite)
-	} 
-}
-
-pub fn unsetenv(name string) int {
-	$if windows {
-		format := '${name}='
-		
-		return C._putenv(format.cstr())
-	} 
-	$else { 
-		return C.unsetenv(name.cstr())
-	} 
-}
-
-// `file_exists` returns true if `path` exists.
-pub fn file_exists(path string) bool {
-	$if windows {
-		return C._access( path.str, 0 ) != -1
 	}
-	return C.access( path.str, 0 ) != -1
+	return 'unknown'
 }
 
-pub fn dir_exists(path string) bool {
-	$if windows {
-		attr := int(C.GetFileAttributes(path.cstr())) 
-		if attr == INVALID_FILE_ATTRIBUTES {
-			return false
+// rmdir_all recursively removes the specified directory.
+pub fn rmdir_all(path string) ? {
+	mut ret_err := ''
+	items := ls(path) ?
+	for item in items {
+		fullpath := join_path(path, item)
+		if is_dir(fullpath) {
+			rmdir_all(fullpath) or { ret_err = err.msg }
+		} else {
+			rm(fullpath) or { ret_err = err.msg }
 		}
-		if (attr & FILE_ATTRIBUTE_DIRECTORY) != 0 {
-			return true
-		}
-		return false
-	} 
-	$else { 
-		dir := C.opendir(path.cstr())
-		res := !isnil(dir)
-		if res {
-			C.closedir(dir)
-		}
-		return res
-	} 
-}
-
-// mkdir creates a new directory with the specified path.
-pub fn mkdir(path string) {
-	$if windows {
-		path = path.replace('/', '\\')
-		C.CreateDirectory(path.cstr(), 0)
 	}
-	$else {
-		C.mkdir(path.cstr(), 511)// S_IRWXU | S_IRWXG | S_IRWXO
+	rmdir(path) or { ret_err = err.msg }
+	if ret_err.len > 0 {
+		return error(ret_err)
 	}
 }
 
-// rm removes file in `path`.
-pub fn rm(path string) {
-	C.remove(path.cstr())
-	// C.unlink(path.cstr())
+// is_dir_empty will return a `bool` whether or not `path` is empty.
+pub fn is_dir_empty(path string) bool {
+	items := ls(path) or { return true }
+	return items.len == 0
 }
 
-
-// rmdir removes a specified directory.
-pub fn rmdir(path string) {
-	$if !windows {
-		C.rmdir(path.cstr())		
-	}
-	$else {
-		C.RemoveDirectoryA(path.cstr())
-	}
+// file_ext will return the part after the last occurence of `.` in `path`.
+// The `.` is included.
+pub fn file_ext(path string) string {
+	pos := path.last_index('.') or { return '' }
+	return path[pos..]
 }
 
-
-fn print_c_errno() {
-	//C.printf('errno=%d err="%s"\n', errno, C.strerror(errno)) 
-}
-
-
-pub fn ext(path string) string {
-	pos := path.last_index('.')
-	if pos == -1 {
-		return ''
-	}
-	return path.right(pos)
-}
-
-
-// dir returns all but the last element of path, typically the path's directory.  
+// dir returns all but the last element of path, typically the path's directory.
+// After dropping the final element, trailing slashes are removed.
+// If the path is empty, dir returns ".". If the path consists entirely of separators,
+// dir returns a single separator.
+// The returned path does not end in a separator unless it is the root directory.
 pub fn dir(path string) string {
-	mut pos := -1
-	// TODO PathSeparator defined in os_win.v doesn't work when building V, 
-	// because v.c is generated for a nix system. 
-	$if windows { 
-		pos = path.last_index('\\') 
-	} 
-	$else { 
-		pos = path.last_index(PathSeparator) 
-	} 
-	if pos == -1 {
-		return '.' 
-	} 
-	return path.left(pos) 
-} 
-
-fn path_sans_ext(path string) string {
-	pos := path.last_index('.')
-	if pos == -1 {
-		return path
+	if path == '' {
+		return '.'
 	}
-	return path.left(pos)
+	pos := path.last_index(path_separator) or { return '.' }
+	return path[..pos]
 }
 
-
-pub fn basedir(path string) string {
-	pos := path.last_index('/')
-	if pos == -1 {
-		return path
+// base returns the last element of path.
+// Trailing path separators are removed before extracting the last element.
+// If the path is empty, base returns ".". If the path consists entirely of separators, base returns a
+// single separator.
+pub fn base(path string) string {
+	if path == '' {
+		return '.'
 	}
-	return path.left(pos + 1)
+	if path == path_separator {
+		return path_separator
+	}
+	if path.ends_with(path_separator) {
+		path2 := path[..path.len - 1]
+		pos := path2.last_index(path_separator) or { return path2.clone() }
+		return path2[pos + 1..]
+	}
+	pos := path.last_index(path_separator) or { return path.clone() }
+	return path[pos + 1..]
 }
 
-pub fn filename(path string) string {
-	return path.all_after('/')
+// file_name will return all characters found after the last occurence of `path_separator`.
+// file extension is included.
+pub fn file_name(path string) string {
+	return path.all_after_last(path_separator)
 }
 
-// get_line returns a one-line string from stdin 
+// input_opt returns a one-line string from stdin, after printing a prompt.
+// In the event of error (end of input), it returns `none`.
+pub fn input_opt(prompt string) ?string {
+	print(prompt)
+	flush()
+	res := get_raw_line()
+	if res.len > 0 {
+		return res.trim_right('\r\n')
+	}
+	return none
+}
+
+// input returns a one-line string from stdin, after printing a prompt.
+// In the event of error (end of input), it returns '<EOF>'.
+pub fn input(prompt string) string {
+	res := input_opt(prompt) or { return '<EOF>' }
+	return res
+}
+
+// get_line returns a one-line string from stdin
 pub fn get_line() string {
-    str := get_raw_line()
-    if str[str.len - 1] == `\n` {
-        return str.substr(0, str.len - 1)
-    }
-
-    return str
-}
-
-// get_raw_line returns a one-line string from stdin along with '\n' if there is any
-pub fn get_raw_line() string {
+	str := get_raw_line()
 	$if windows {
-		max := 256
-		buf := malloc(max)
-		h_input := C.GetStdHandle(STD_INPUT_HANDLE)
-		if h_input == INVALID_HANDLE_VALUE {
-			panic('get_raw_line() error getting input handle.')
-		}
-		nr_chars := 0
-		// NOTE: Once we have UTF8 encode function to
-		// convert utf16 to utf8, change to ReadConsoleW
-		C.ReadConsole(h_input, buf, max, &nr_chars, 0)
-		if nr_chars == 0 {
-			return ''
-		}
-		return tos(buf, nr_chars)
+		return str.trim_right('\r\n')
 	}
-	$else {
-		//u64 is used because C.getline needs a size_t as second argument
-		//Otherwise, it would cause a valgrind warning and may be dangerous
-		//Malloc takes an int as argument so a cast has to be made
-		max := u64(256)
-		buf := malloc(int(max))
-		nr_chars := C.getline(&buf, &max, stdin)
-		if nr_chars == 0 {
-			return ''
-		}
-		return string(buf, nr_chars)
-	} 
+	return str.trim_right('\n')
 }
 
+// get_lines returns an array of strings read from from stdin.
+// reading is stopped when an empty line is read.
+pub fn get_lines() []string {
+	mut line := ''
+	mut inputstr := []string{}
+	for {
+		line = get_line()
+		if line.len <= 0 {
+			break
+		}
+		line = line.trim_space()
+		inputstr << line
+	}
+	return inputstr
+}
+
+// get_lines_joined returns a string of the values read from from stdin.
+// reading is stopped when an empty line is read.
+pub fn get_lines_joined() string {
+	mut line := ''
+	mut inputstr := ''
+	for {
+		line = get_line()
+		if line.len <= 0 {
+			break
+		}
+		line = line.trim_space()
+		inputstr += line
+	}
+	return inputstr
+}
+
+// get_raw_lines_joined reads *all* input lines from stdin.
+// It returns them as one large string. NB: unlike os.get_lines_joined,
+// empty lines (that contain only `\r\n` or `\n`), will be present in
+// the output.
+// Reading is stopped, only on EOF of stdin.
+pub fn get_raw_lines_joined() string {
+	mut line := ''
+	mut lines := []string{}
+	for {
+		line = get_raw_line()
+		if line.len <= 0 {
+			break
+		}
+		lines << line
+	}
+	res := lines.join('')
+	return res
+}
+
+// user_os returns current user operating system name.
 pub fn user_os() string {
 	$if linux {
 		return 'linux'
 	}
-	$if mac {
-		return 'mac'
+	$if macos {
+		return 'macos'
 	}
 	$if windows {
 		return 'windows'
 	}
 	$if freebsd {
-		return 'freebsd' 
-	} 
+		return 'freebsd'
+	}
 	$if openbsd {
-		return 'openbsd' 
-	} 
+		return 'openbsd'
+	}
 	$if netbsd {
-		return 'netbsd' 
-	} 
+		return 'netbsd'
+	}
 	$if dragonfly {
-		return 'dragonfly' 
-	} 
+		return 'dragonfly'
+	}
+	$if android {
+		return 'android'
+	}
+	$if solaris {
+		return 'solaris'
+	}
+	$if haiku {
+		return 'haiku'
+	}
 	return 'unknown'
 }
 
-// home_dir returns path to user's home directory.
+// home_dir returns path to the user's home directory.
 pub fn home_dir() string {
-	mut home := os.getenv('HOME')
 	$if windows {
-		home = os.getenv('HOMEDRIVE')
-		if home.len == 0 {
-			home = os.getenv('SYSTEMDRIVE')
-		}
-		mut homepath := os.getenv('HOMEPATH')
-		if homepath.len == 0 {
-			homepath = '\\Users\\' + os.getenv('USERNAME')
-		}
-		home += homepath
+		return getenv('USERPROFILE')
+	} $else {
+		// println('home_dir() call')
+		// res:= os.getenv('HOME')
+		// println('res="$res"')
+		return getenv('HOME')
 	}
-	home += '/'
-	return home
 }
 
-// write_file writes `text` data to a file in `path`. 
-pub fn write_file(path, text string) {
-	f := os.create(path) or {
-		return 
-	} 
-	f.write(text)
+// write_file writes `text` data to a file in `path`.
+pub fn write_file(path string, text string) ? {
+	mut f := create(path) ?
+	f.write_string(text) ?
 	f.close()
 }
 
-pub fn clear() {
-	C.printf('\x1b[2J')
-	C.printf('\x1b[H')
+// write_file_array writes the data in `buffer` to a file in `path`.
+pub fn write_file_array(path string, buffer array) ? {
+	mut f := create(path) ?
+	unsafe { f.write_ptr_at(buffer.data, (buffer.len * buffer.element_size), 0) }
+	f.close()
 }
 
-fn on_segfault(f voidptr) {
+// executable_fallback is used when there is not a more platform specific and accurate implementation.
+// It relies on path manipulation of os.args[0] and os.wd_at_startup, so it may not work properly in
+// all cases, but it should be better, than just using os.args[0] directly.
+fn executable_fallback() string {
+	if os.args.len == 0 {
+		// we are early in the bootstrap, os.args has not been initialized yet :-|
+		return ''
+	}
+	mut exepath := os.args[0]
 	$if windows {
+		if !exepath.contains('.exe') {
+			exepath += '.exe'
+		}
+	}
+	if !is_abs_path(exepath) {
+		if exepath.contains(path_separator) {
+			exepath = join_path(os.wd_at_startup, exepath)
+		} else {
+			// no choice but to try to walk the PATH folders :-| ...
+			foundpath := find_abs_path_of_executable(exepath) or { '' }
+			if foundpath.len > 0 {
+				exepath = foundpath
+			}
+		}
+	}
+	exepath = real_path(exepath)
+	return exepath
+}
+
+// find_exe_path walks the environment PATH, just like most shell do, it returns
+// the absolute path of the executable if found
+pub fn find_abs_path_of_executable(exepath string) ?string {
+	if exepath == '' {
+		return error('expected non empty `exepath`')
+	}
+	if is_abs_path(exepath) {
+		return real_path(exepath)
+	}
+	mut res := ''
+	paths := getenv('PATH').split(path_delimiter)
+	for p in paths {
+		found_abs_path := join_path(p, exepath)
+		if exists(found_abs_path) && is_executable(found_abs_path) {
+			res = found_abs_path
+			break
+		}
+	}
+	if res.len > 0 {
+		return real_path(res)
+	}
+	return error('failed to find executable')
+}
+
+// exists_in_system_path returns `true` if `prog` exists in the system's PATH
+pub fn exists_in_system_path(prog string) bool {
+	find_abs_path_of_executable(prog) or { return false }
+	return true
+}
+
+// is_file returns a `bool` indicating whether the given `path` is a file.
+pub fn is_file(path string) bool {
+	return exists(path) && !is_dir(path)
+}
+
+// is_abs_path returns `true` if `path` is absolute.
+pub fn is_abs_path(path string) bool {
+	if path.len == 0 {
+		return false
+	}
+	$if windows {
+		return path[0] == `/` || // incase we're in MingGW bash
+		(path[0].is_letter() && path.len > 1 && path[1] == `:`)
+	}
+	return path[0] == `/`
+}
+
+// join_path returns a path as string from input string parameter(s).
+[manualfree]
+pub fn join_path(base string, dirs ...string) string {
+	mut result := []string{}
+	result << base.trim_right('\\/')
+	for d in dirs {
+		result << d
+	}
+	res := result.join(path_separator)
+	unsafe { result.free() }
+	return res
+}
+
+// walk_ext returns a recursive list of all files in `path` ending with `ext`.
+pub fn walk_ext(path string, ext string) []string {
+	if !is_dir(path) {
+		return []
+	}
+	mut files := ls(path) or { return [] }
+	mut res := []string{}
+	separator := if path.ends_with(path_separator) { '' } else { path_separator }
+	for file in files {
+		if file.starts_with('.') {
+			continue
+		}
+		p := path + separator + file
+		if is_dir(p) && !is_link(p) {
+			res << walk_ext(p, ext)
+		} else if file.ends_with(ext) {
+			res << p
+		}
+	}
+	return res
+}
+
+// walk recursively traverses the given directory `path`.
+// When a file is encountred it will call the callback function with current file as argument.
+pub fn walk(path string, f fn (string)) {
+	if !is_dir(path) {
 		return
 	}
-	$if mac {
-		mut sa := C.sigaction{}
-		C.memset(&sa, 0, sizeof(sigaction))
-		C.sigemptyset(&sa.sa_mask)
-		sa.sa_sigaction = f
-		sa.sa_flags   = SA_SIGINFO
-		C.sigaction(SIGSEGV, &sa, 0)
+	mut files := ls(path) or { return }
+	mut local_path_separator := path_separator
+	if path.ends_with(path_separator) {
+		local_path_separator = ''
+	}
+	for file in files {
+		p := path + local_path_separator + file
+		if is_dir(p) && !is_link(p) {
+			walk(p, f)
+		} else if exists(p) {
+			f(p)
+		}
+	}
+	return
+}
+
+// log will print "os.log: "+`s` ...
+pub fn log(s string) {
+	//$if macos {
+	// Use NSLog() on macos
+	// C.darwin_log(s)
+	//} $else {
+	println('os.log: ' + s)
+	//}
+}
+
+// mkdir_all will create a valid full path of all directories given in `path`.
+pub fn mkdir_all(path string) ? {
+	mut p := if path.starts_with(path_separator) { path_separator } else { '' }
+	path_parts := path.trim_left(path_separator).split(path_separator)
+	for subdir in path_parts {
+		p += subdir + path_separator
+		if exists(p) && is_dir(p) {
+			continue
+		}
+		mkdir(p) or { return error('folder: $p, error: $err') }
 	}
 }
 
-pub fn executable() string {
-	mut result := malloc(MAX_PATH) 
-	$if linux {
-		count := int(C.readlink('/proc/self/exe', result, MAX_PATH ))
-		if count < 0 {
-			panic('error reading /proc/self/exe to get exe path')
-		}
-		return string(result, count)
-	}
-	$if windows {
-		ret := int(C.GetModuleFileName( 0, result, MAX_PATH ))
-		return string( result, ret)
-	}
-	$if mac {
-		pid := C.getpid() 
-		ret := C.proc_pidpath (pid, result, MAX_PATH) 
-		if ret <= 0  {
-			println('os.executable() failed') 
-			return '.'  
-		}  
-		return string(result) 
-	}
-	$if freebsd {
-		mut mib := [1 /* CTL_KERN */, 14 /* KERN_PROC */, 12 /* KERN_PROC_PATHNAME */, -1]!! 
-		size := MAX_PATH 
-		C.sysctl(mib, 4, result, &size, 0, 0) 
-		return string(result) 
-	} 
-	$if openbsd {
-		// "Sadly there is no way to get the full path of the executed file in OpenBSD." 
-		// lol 
-		return os.args[0] 
-	} 
-	$if netbsd {
-		count := int(C.readlink('/proc/curproc/exe', result, MAX_PATH ))
-		if count < 0 {
-			panic('error reading /proc/curproc/exe to get exe path')
-		}
-		return string(result, count)
-	} 
-	$if dragonfly {
-		count := int(C.readlink('/proc/curproc/file', result, MAX_PATH ))
-		if count < 0 {
-			panic('error reading /proc/curproc/file to get exe path')
-		}
-		return string(result, count)
-	} 
-	return '.' 
-}
-
-pub fn is_dir(path string) bool {
-	$if windows {
-		return dir_exists(path) 
-		//val := int(C.GetFileAttributes(path.to_wide()))
-		// Note: this return is broke (wrong). we have dir_exists already how will this differ?
-		//return (val &FILE_ATTRIBUTE_DIRECTORY) > 0
-	} 
-	$else { 
-		statbuf := C.stat{}
-		cstr := path.cstr()
-		if C.stat(cstr, &statbuf) != 0 {
-			return false
-		}
-		return statbuf.st_mode & S_IFMT == S_IFDIR
-	} 
-}
-
-pub fn chdir(path string) {
-	$if windows {
-		C._chdir(path.cstr())
-	}
-	$else { 
-		C.chdir(path.cstr())
-	} 
-}
-
-pub fn getwd() string {
-	buf := malloc(512)
-	$if windows {
-		if C._getcwd(buf, 512) == 0 {
-			return ''
-		}
-	}
-	$else { 
-		if C.getcwd(buf, 512) == 0 {
-			return ''
-		}
-	} 
-	return string(buf)
-}
-
-// win: FILETIME
-// https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-filetime
-struct filetime {
-  dwLowDateTime u32
-  dwHighDateTime u32
-}
-
-// win: WIN32_FIND_DATA
-// https://docs.microsoft.com/en-us/windows/win32/api/minwinbase/ns-minwinbase-_win32_find_dataa
-struct win32finddata {
-mut:
-    dwFileAttributes u32
-    ftCreationTime filetime
-  	ftLastAccessTime filetime
-  	ftLastWriteTime filetime
-	nFileSizeHigh u32
-	nFileSizeLow u32
-	dwReserved0 u32
-	dwReserved1 u32
-	cFileName [260]u16 // MAX_PATH = 260 
-	cAlternateFileName [14]u16 // 14
-  	dwFileType u32
-  	dwCreatorType u32
-  	wFinderFlags u16
-}
-
-pub fn ls(path string) []string {
-	$if windows {
-		mut find_file_data := win32finddata{}
-		mut dir_files := []string
-		// We can also check if the handle is valid. but using dir_exists instead
-		// h_find_dir := C.FindFirstFile(path.cstr(), &find_file_data)
-		// if (INVALID_HANDLE_VALUE == h_find_dir) {
-		//     return dir_files
-		// }
-		// C.FindClose(h_find_dir)
-		if !dir_exists(path) {
-			println('ls() couldnt open dir "$path" (does not exist).')
-			return dir_files
-		}
-		// NOTE: Should eventually have path struct & os dependant path seperator (eg os.PATH_SEPERATOR)
-		// we need to add files to path eg. c:\windows\*.dll or :\windows\*
-		path_files := '$path\\*' 
-		// NOTE:TODO: once we have a way to convert utf16 wide character to utf8
-		// we should use FindFirstFileW and FindNextFileW
-		h_find_files := C.FindFirstFile(path_files.cstr(), &find_file_data)
-		first_filename := tos(&find_file_data.cFileName, strlen(find_file_data.cFileName))
-		if first_filename != '.' && first_filename != '..' {
-			dir_files << first_filename
-		}
-		for C.FindNextFile(h_find_files, &find_file_data) {
-			filename := tos(&find_file_data.cFileName, strlen(find_file_data.cFileName))
-			if filename != '.' && filename != '..' {
-				dir_files << filename.clone()
-			}
-		}
-		C.FindClose(h_find_files)
-		return dir_files
-	} 
-	$else { 
-		mut res := []string
-		dir := C.opendir(path.cstr()) 
-		if isnil(dir) {
-			println('ls() couldnt open dir "$path"')
-			print_c_errno()
-			return res
-		}
-		mut ent := &C.dirent{!}
-		for {
-			ent = C.readdir(dir)
-			if isnil(ent) {
-				break
-			}
-			name := tos_clone(ent.d_name)
-			if name != '.' && name != '..' && name != '' {
-				res << name
-			}
-		}
-		C.closedir(dir)
-		return res
-	} 
-}
-
-pub fn signal(signum int, handler voidptr) {
-	C.signal(signum, handler)
-}
-
-pub fn fork() int {
+// cache_dir returns the path to a *writable* user specific folder, suitable for writing non-essential data.
+pub fn cache_dir() string {
+	// See: https://specifications.freedesktop.org/basedir-spec/basedir-spec-latest.html
+	// There is a single base directory relative to which user-specific non-essential
+	// (cached) data should be written. This directory is defined by the environment
+	// variable $XDG_CACHE_HOME.
+	// $XDG_CACHE_HOME defines the base directory relative to which user specific
+	// non-essential data files should be stored. If $XDG_CACHE_HOME is either not set
+	// or empty, a default equal to $HOME/.cache should be used.
 	$if !windows {
-		pid := C.fork()
-		return pid
+		xdg_cache_home := getenv('XDG_CACHE_HOME')
+		if xdg_cache_home != '' {
+			return xdg_cache_home
+		}
 	}
-}
-
-pub fn wait() int {
-	$if !windows {
-		pid := C.wait(0)
-		return pid
+	cdir := join_path(home_dir(), '.cache')
+	if !is_dir(cdir) && !is_link(cdir) {
+		mkdir(cdir) or { panic(err) }
 	}
+	return cdir
 }
 
-pub fn file_last_mod_unix(path string) int {
-	attr := C.stat{} 
-	//# struct stat attr;
-	C.stat(path.str, &attr) 
-	//# stat(path.str, &attr);
-	return attr.st_mtime 
-	//# return attr.st_mtime ;
+// temp_dir returns the path to a folder, that is suitable for storing temporary files.
+pub fn temp_dir() string {
+	mut path := getenv('TMPDIR')
+	$if windows {
+		if path == '' {
+			// TODO see Qt's implementation?
+			// https://doc.qt.io/qt-5/qdir.html#tempPath
+			// https://github.com/qt/qtbase/blob/e164d61ca8263fc4b46fdd916e1ea77c7dd2b735/src/corelib/io/qfilesystemengine_win.cpp#L1275
+			path = getenv('TEMP')
+			if path == '' {
+				path = getenv('TMP')
+			}
+			if path == '' {
+				path = 'C:/tmp'
+			}
+		}
+	}
+	$if android {
+		// TODO test+use '/data/local/tmp' on Android before using cache_dir()
+		if path == '' {
+			path = cache_dir()
+		}
+	}
+	if path == '' {
+		path = '/tmp'
+	}
+	return path
 }
- 
 
-fn log(s string) {
+fn default_vmodules_path() string {
+	return join_path(home_dir(), '.vmodules')
 }
 
-pub fn print_backtrace() {
-/* 
-	# void *buffer[100];
-	nptrs := 0
-	# nptrs = backtrace(buffer, 100);
-	# printf("%d!!\n", nptrs);
-	# backtrace_symbols_fd(buffer, nptrs, STDOUT_FILENO) ;
-*/ 
+// vmodules_dir returns the path to a folder, where v stores its global modules.
+pub fn vmodules_dir() string {
+	paths := vmodules_paths()
+	if paths.len > 0 {
+		return paths[0]
+	}
+	return default_vmodules_path()
+}
+
+// vmodules_paths returns a list of paths, where v looks up for modules.
+// You can customize it through setting the environment variable VMODULES
+pub fn vmodules_paths() []string {
+	mut path := getenv('VMODULES')
+	if path == '' {
+		path = default_vmodules_path()
+	}
+	list := path.split(path_delimiter).map(it.trim_right(path_separator))
+	return list
+}
+
+// resource_abs_path returns an absolute path, for the given `path`.
+// (the path is expected to be relative to the executable program)
+// See https://discordapp.com/channels/592103645835821068/592294828432424960/630806741373943808
+// It gives a convenient way to access program resources like images, fonts, sounds and so on,
+// *no matter* how the program was started, and what is the current working directory.
+[manualfree]
+pub fn resource_abs_path(path string) string {
+	exe := executable()
+	dexe := dir(exe)
+	mut base_path := real_path(dexe)
+	vresource := getenv('V_RESOURCE_PATH')
+	if vresource.len != 0 {
+		base_path = vresource
+	}
+	fp := join_path(base_path, path)
+	res := real_path(fp)
+	unsafe {
+		fp.free()
+		base_path.free()
+	}
+	return res
+}
+
+pub struct Uname {
+pub mut:
+	sysname  string
+	nodename string
+	release  string
+	version  string
+	machine  string
+}
+
+[deprecated: 'use os.execute or os.execute_or_panic instead']
+pub fn exec(cmd string) ?Result {
+	res := execute(cmd)
+	if res.exit_code < 0 {
+		return error_with_code(res.output, -1)
+	}
+	return res
+}
+
+pub fn execute_or_panic(cmd string) Result {
+	res := execute(cmd)
+	if res.exit_code != 0 {
+		eprintln('failed    cmd: $cmd')
+		eprintln('failed   code: $res.exit_code')
+		panic(res.output)
+	}
+	return res
+}
+
+// is_atty returns 1 if the `fd` file descriptor is open and refers to a terminal
+pub fn is_atty(fd int) int {
+	$if windows {
+		mut mode := u32(0)
+		osfh := voidptr(C._get_osfhandle(fd))
+		C.GetConsoleMode(osfh, voidptr(&mode))
+		return int(mode)
+	} $else {
+		return C.isatty(fd)
+	}
 }

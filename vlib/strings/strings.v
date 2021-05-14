@@ -1,14 +1,13 @@
-module strings 
+module strings
 
-pub fn repeat(c byte, n int) string {
-	if n <= 0 {
-		return ''
+// import rand
+// random returns a random string with `n` characters
+/*
+pub fn random(n int) string {
+	buf := vmalloc(n)
+	for i in 0..n {
+		buf[i] = rand.next()
 	}
-	mut arr := malloc(n + 1)
-	//mut arr := [byte(0); n + 1] 
-	for i := 0; i < n; i++ {
-		arr[i] = c
-	}
-	arr[n] = `\0`
-	return string(arr, n)
+	return tos(buf)
 }
+*/
